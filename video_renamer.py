@@ -9,7 +9,7 @@ import argparse
 from datetime import datetime, timedelta
 
 
-def extract_bright_text(image_path, brightness_threshold=180, sat_max=80, region=None, skip_filter=False, debug=False):
+def extract_bright_text(image_path, brightness_threshold=180, sat_max=80, region=None, skip_filter=False, debug=False, aggressive=False):
     """
     Isolates bright, low-saturation pixels from a frame (e.g. DVR timestamps).
     Works in HSV color space so brightness is separated from color,
@@ -28,9 +28,10 @@ def extract_bright_text(image_path, brightness_threshold=180, sat_max=80, region
                         Use this to isolate the known timestamp area and reduce noise.
         skip_filter (bool): If True, skip brightness/saturation filtering (for --radio mode).
         debug (bool): If True, save intermediate images for debugging.
+        aggressive (bool): If True, use more aggressive background rejection for white text.
 
     Returns:
-        str: Path to the processed (binary mask) image ready for OCR.
+        str: Path to the processed image ready for OCR (keeps original pixel values, not binary mask).
     """
     img = cv2.imread(image_path)
 
@@ -77,31 +78,33 @@ def extract_bright_text(image_path, brightness_threshold=180, sat_max=80, region
         cv2.imwrite(image_path.replace(".jpg", "_debug_mask_before_morph.jpg"), mask)
         print(f"  [DEBUG] Mask has {np.sum(mask > 0)} white pixels")
 
-    # Morphological close: fills small gaps inside characters
-    kernel = np.ones((3, 3), np.uint8)
-    # mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    # Dilation: reconnects broken digit segments caused by video compression
-    # e.g. prevents "07:01:26" from being read as "07:01:2_"
-    # mask = cv2.dilate(mask, kernel, iterations=1)
+    # Instead of saving binary mask, apply the mask to the original image
+    # This keeps the actual pixel values (not just white/black) which Doctr prefers
+    result = cv2.bitwise_and(img, img, mask=mask)
+    
+    # Convert to grayscale for better OCR (Doctr handles grayscale well)
+    result_gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+    
+    # Optional: boost contrast to make text clearer
+    result_gray = cv2.equalizeHist(result_gray)
 
     if debug:
-        cv2.imwrite(image_path.replace(".jpg", "_debug_mask_after_morph.jpg"), mask)
-        print(f"  [DEBUG] After morph - mask has {np.sum(mask > 0)} white pixels")
+        cv2.imwrite(image_path.replace(".jpg", "_debug_result.jpg"), result)
+        cv2.imwrite(image_path.replace(".jpg", "_debug_result_gray.jpg"), result_gray)
 
-    # Save the processed mask next to the original frame
+    # Save the processed image (not binary mask) next to the original frame
     processed_path = image_path.replace(".jpg", "_processed.jpg")
-    cv2.imwrite(processed_path, mask)
+    cv2.imwrite(processed_path, result_gray)
 
     if debug:
-        cv2.imwrite(image_path.replace(".jpg", "_debug_final.jpg"), mask)
+        cv2.imwrite(image_path.replace(".jpg", "_debug_final.jpg"), result_gray)
 
     return processed_path
 
 
 class VideoRenamer:
     def __init__(self, folder_path, lang=['en'], fallback_minutes=30,
-                 forced_prefix=None, brightness_threshold=180, sat_max=80, region=None, radio_mode=False, debug=False):
+                 forced_prefix=None, brightness_threshold=180, sat_max=80, region=None, radio_mode=False, debug=False, aggressive=False):
         self.folder_path = folder_path
         self.fallback_minutes = fallback_minutes
         self.forced_prefix = forced_prefix
@@ -110,11 +113,11 @@ class VideoRenamer:
         self.region = region
         self.radio_mode = radio_mode
         self.debug = debug
+        self.aggressive = aggressive
 
         # Initialize Doctr OCR predictor (CPU only for Plesk/server compatibility)
-        # Using db_resnet50 for detection and crnn_vgg16_bn for recognition
-        # This is more accurate than EasyOCR for TV timestamps
-        self.ocr = ocr_predictor(det_arch='db_resnet50', reco_arch='crnn_vgg16_bn', pretrained=True)
+        # Using same model as your working script
+        self.ocr = ocr_predictor(pretrained=True)
         
         # Regex patterns
         # Date: YYYY-MM-DD or DD-MM-YYYY (accepts - / . as separators)
@@ -216,15 +219,15 @@ class VideoRenamer:
             sat_max=self.sat_max,
             region=self.region,
             skip_filter=self.radio_mode,  # Pass the radio_mode flag
-            debug=self.debug
+            debug=self.debug,
+            aggressive=self.aggressive  # Pass aggressive flag
         )
 
         print(f"\nOCR raw results for {image_path} (preprocessed: {processed_path}):")
 
-        # Use Doctr for OCR instead of EasyOCR
-        # Doctr is more accurate for TV timestamps and handles binary masks better
+        # Use Doctr for OCR - exactly like your working script
         try:
-            # Load the processed image for Doctr
+            # Load the processed image for Doctr - same method as your working script
             doc = DocumentFile.from_images(processed_path)
             result = self.ocr(doc)
             
@@ -232,19 +235,18 @@ class VideoRenamer:
             time_found = None
             xxx_parts = []
             
-            # Extract text from Doctr result
-            all_text = []
+            # Extract text exactly like your working script
+            lines = []
             for page in result.pages:
                 for block in page.blocks:
                     for line in block.lines:
-                        line_text = ""
-                        for word in line.words:
-                            line_text += word.value + " "
-                            all_text.append(word.value)
-                            print(f"  -> '{word.value}' (confidence: {word.confidence:.2f})")
+                        text = " ".join([word.value for word in line.words])
+                        if text.strip():
+                            print(f"  -> '{text}'")
+                            lines.append(text)
                             
-                            # Process each word individually
-                            d, tm = self.extract_datetime(word.value)
+                            # Process the extracted text
+                            d, tm = self.extract_datetime(text)
                             
                             if d and not date_found:
                                 date_found = d
@@ -254,27 +256,29 @@ class VideoRenamer:
                             
                             # Collect non-date/time text as potential filename prefix
                             if not d and not tm:
-                                cleaned = self.clean_string(word.value)
+                                cleaned = self.clean_string(text)
                                 if cleaned and len(cleaned) > 2 and not cleaned.isdigit():
                                     xxx_parts.append(cleaned)
-                        
-                        # Also process the entire line
-                        if line_text.strip():
-                            d, tm = self.extract_datetime(line_text.strip())
+            
+            # Also process each word individually for more granular detection
+            for page in result.pages:
+                for block in page.blocks:
+                    for line in block.lines:
+                        for word in line.words:
+                            d, tm = self.extract_datetime(word.value)
                             if d and not date_found:
                                 date_found = d
                             if tm and not time_found:
                                 time_found = tm
             
-            # If no words found, try fallback with entire text
-            if not date_found and not time_found:
-                full_text = " ".join(all_text)
-                if full_text:
-                    d, tm = self.extract_datetime(full_text)
-                    if d and not date_found:
-                        date_found = d
-                    if tm and not time_found:
-                        time_found = tm
+            # Combine all text for fallback
+            all_text = " ".join(lines)
+            if not date_found and not time_found and all_text:
+                d, tm = self.extract_datetime(all_text)
+                if d and not date_found:
+                    date_found = d
+                if tm and not time_found:
+                    time_found = tm
             
             xxx = xxx_parts[0] if xxx_parts else ""
             
@@ -382,6 +386,9 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true",
                         help="Save debug images to see what the OCR is processing.")
 
+    parser.add_argument("--aggressive", action="store_true",
+                        help="Use aggressive background rejection for white text on TV recordings.")
+
     args = parser.parse_args()
 
     if os.path.isdir(args.folder):
@@ -393,7 +400,8 @@ if __name__ == "__main__":
             sat_max=args.sat_max,
             region=tuple(args.region) if args.region else None,
             radio_mode=args.radio,
-            debug=args.debug
+            debug=args.debug,
+            aggressive=args.aggressive
         )
         renamer.process_folder()
     else:
