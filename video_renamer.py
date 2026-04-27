@@ -25,28 +25,22 @@ def extract_bright_text(image_path, brightness_threshold=180, sat_max=80, region
         region (tuple): Optional crop region as fractions of image dimensions,
                         in the form (x1, y1, x2, y2). Example: (0, 0.85, 0.5, 1.0)
                         targets the bottom-left quarter of the frame.
-                        Use this to isolate the known timestamp area and reduce noise.
         skip_filter (bool): If True, skip brightness/saturation filtering (for --radio mode).
         debug (bool): If True, save intermediate images for debugging.
         aggressive (bool): If True, use more aggressive background rejection for white text.
 
     Returns:
-        str: Path to the processed image ready for OCR (keeps original pixel values, not binary mask).
+        str: Path to the processed image ready for OCR.
     """
     img = cv2.imread(image_path)
 
-    # Graceful fallback: if the image can't be loaded, return the original path
-    # so OCR can still attempt to run on the raw frame
     if img is None:
         print(f"  [WARNING] Could not load image for preprocessing: {image_path}")
         return image_path
 
-    # Save original for debug
     if debug:
         cv2.imwrite(image_path.replace(".jpg", "_debug_original.jpg"), img)
 
-    # Optional crop to a known timestamp region before filtering.
-    # Coordinates are given as fractions (0.0-1.0) of the image dimensions.
     if region:
         h, w = img.shape[:2]
         x1, y1, x2, y2 = region
@@ -55,7 +49,6 @@ def extract_bright_text(image_path, brightness_threshold=180, sat_max=80, region
             cv2.imwrite(image_path.replace(".jpg", "_debug_cropped.jpg"), img)
             print(f"  [DEBUG] Cropped to region {region} - size: {img.shape}")
 
-    # If skip_filter is True (--radio mode), save the cropped image directly
     if skip_filter:
         processed_path = image_path.replace(".jpg", "_processed.jpg")
         cv2.imwrite(processed_path, img)
@@ -63,13 +56,8 @@ def extract_bright_text(image_path, brightness_threshold=180, sat_max=80, region
             cv2.imwrite(image_path.replace(".jpg", "_debug_final.jpg"), img)
         return processed_path
 
-    # Convert BGR to HSV so we can filter on brightness (V channel) independently
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-    # Keep only very bright, low-saturation pixels (white/grey text)
-    # H (hue): full range 0-255, we don't care about the color
-    # S (saturation): capped at sat_max to exclude colored overlays and logos
-    # V (value/brightness): must exceed brightness_threshold
     lower = np.array([0, 0, brightness_threshold])
     upper = np.array([255, sat_max, 255])
     mask = cv2.inRange(hsv, lower, upper)
@@ -78,21 +66,14 @@ def extract_bright_text(image_path, brightness_threshold=180, sat_max=80, region
         cv2.imwrite(image_path.replace(".jpg", "_debug_mask_before_morph.jpg"), mask)
         print(f"  [DEBUG] Mask has {np.sum(mask > 0)} white pixels")
 
-    # Instead of saving binary mask, apply the mask to the original image
-    # This keeps the actual pixel values (not just white/black) which Doctr prefers
     result = cv2.bitwise_and(img, img, mask=mask)
-    
-    # Convert to grayscale for better OCR (Doctr handles grayscale well)
     result_gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-    
-    # Optional: boost contrast to make text clearer
     result_gray = cv2.equalizeHist(result_gray)
 
     if debug:
         cv2.imwrite(image_path.replace(".jpg", "_debug_result.jpg"), result)
         cv2.imwrite(image_path.replace(".jpg", "_debug_result_gray.jpg"), result_gray)
 
-    # Save the processed image (not binary mask) next to the original frame
     processed_path = image_path.replace(".jpg", "_processed.jpg")
     cv2.imwrite(processed_path, result_gray)
 
@@ -104,7 +85,9 @@ def extract_bright_text(image_path, brightness_threshold=180, sat_max=80, region
 
 class VideoRenamer:
     def __init__(self, folder_path, lang=['en'], fallback_minutes=30,
-                 forced_prefix=None, brightness_threshold=180, sat_max=80, region=None, radio_mode=False, debug=False, aggressive=False):
+                 forced_prefix=None, brightness_threshold=180, sat_max=80,
+                 region=None, radio_mode=False, debug=False, aggressive=False,
+                 frame_step=5, min_confidence=0.85):
         self.folder_path = folder_path
         self.fallback_minutes = fallback_minutes
         self.forced_prefix = forced_prefix
@@ -114,43 +97,63 @@ class VideoRenamer:
         self.radio_mode = radio_mode
         self.debug = debug
         self.aggressive = aggressive
+        self.frame_step = frame_step          # seconds between scanned frames
+        self.min_confidence = min_confidence  # 0.0–1.0 confidence threshold
 
-        # Initialize Doctr OCR predictor (CPU only for Plesk/server compatibility)
-        # Using same model as your working script
         self.ocr = ocr_predictor(pretrained=True)
-        
-        # Regex patterns
-        # Date: YYYY-MM-DD or DD-MM-YYYY (accepts - / . as separators)
+
         self.date_pattern = re.compile(r'(\d{4}[-/.]\d{2}[-/.]\d{2})|(\d{2}[-/.]\d{2}[-/.]\d{4})')
-        # Time: flexible pattern to handle messy OCR output
         self.time_pattern = re.compile(r'\d{2}\s*[:\-.]\s*\d{2}\s*[:\-.]\s*\d{2}')
 
-    def extract_frames(self, video_path):
-        """Extracts the first and last frame of a video using FFMPEG."""
-        first_frame = "first_frame.jpg"
-        last_frame = "last_frame.jpg"
+    # ------------------------------------------------------------------
+    # Frame extraction helpers
+    # ------------------------------------------------------------------
 
-        # Extract first frame
+    def extract_frame_at(self, video_path, offset_seconds, out_path):
+        """Extracts a single frame at a given second offset into the video."""
         subprocess.run([
-            'ffmpeg', '-y', '-i', video_path, '-frames:v', '1', '-q:v', '2', first_frame
+            'ffmpeg', '-y', '-ss', str(offset_seconds),
+            '-i', video_path, '-frames:v', '1', '-q:v', '2', out_path
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return os.path.exists(out_path)
 
-        # Get video duration via ffprobe, then extract last frame
+    def get_video_duration(self, video_path):
+        """Returns video duration in seconds via ffprobe."""
         result = subprocess.run([
             'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
             '-of', 'default=noprint_wrappers=1:nokey=1', video_path
         ], capture_output=True, text=True)
-
         try:
-            duration = float(result.stdout.strip())
+            return float(result.stdout.strip())
+        except (ValueError, AttributeError):
+            return None
+
+    def extract_frames(self, video_path):
+        """
+        Extracts the first and last frame of a video using FFMPEG.
+        Used as a fast path when multi-frame scanning is not needed.
+        """
+        first_frame = "first_frame.jpg"
+        last_frame = "last_frame.jpg"
+
+        subprocess.run([
+            'ffmpeg', '-y', '-i', video_path, '-frames:v', '1', '-q:v', '2', first_frame
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        duration = self.get_video_duration(video_path)
+        if duration:
             subprocess.run([
                 'ffmpeg', '-y', '-ss', str(max(0, duration - 0.5)),
                 '-i', video_path, '-frames:v', '1', '-q:v', '2', last_frame
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except:
+        else:
             last_frame = None
 
-        return first_frame, last_frame
+        return first_frame, last_frame, duration
+
+    # ------------------------------------------------------------------
+    # String / time helpers
+    # ------------------------------------------------------------------
 
     def clean_string(self, s):
         """Sanitizes a string for use in a filename."""
@@ -160,15 +163,11 @@ class VideoRenamer:
         """Fixes OCR artifacts like '07 : 01:26' or '09:04.19' into HH-MM-SS."""
         if not raw_time:
             return None
-
-        # Remove all spaces, then normalize all separators to '-'
         t = raw_time.replace(" ", "")
         t = re.sub(r'[:\.]', '-', t)
-
         parts = t.split('-')
         if len(parts) == 3:
             return "-".join(parts)
-
         return None
 
     def extract_datetime(self, text):
@@ -178,7 +177,6 @@ class VideoRenamer:
         time = None
 
         if date_match:
-            # Normalize date separators to '-'
             date = date_match.group(0).replace('/', '-').replace('.', '-')
             remaining = text.replace(date_match.group(0), '')
         else:
@@ -197,70 +195,84 @@ class VideoRenamer:
             delta = timedelta(minutes=self.fallback_minutes)
             new_time = t + delta if add else t - delta
             return new_time.strftime("%H-%M-%S")
-        except:
+        except Exception:
             return None
+
+    def adjust_time(self, time_str, delta_seconds):
+        """
+        Shifts a HH-MM-SS string by delta_seconds (can be negative).
+        Used to back-calculate the real start time from a mid-video reading.
+        """
+        try:
+            t = datetime.strptime(time_str, "%H-%M-%S")
+            t += timedelta(seconds=delta_seconds)
+            return t.strftime("%H-%M-%S")
+        except Exception:
+            return time_str
+
+    # ------------------------------------------------------------------
+    # OCR core
+    # ------------------------------------------------------------------
 
     def get_info_from_image(self, image_path):
         """
-        Runs preprocessing then OCR to extract date, time, and optional prefix text.
-        Preprocessing isolates bright timestamp pixels before passing to Doctr OCR,
-        which significantly improves accuracy on TV and DVR recordings.
+        Runs preprocessing then OCR to extract date, time, prefix text,
+        and an overall confidence score.
+
+        Returns:
+            tuple: (date_str, time_str, prefix_str, confidence_float)
+                   confidence is the mean word confidence of all OCR words,
+                   or 0.0 on failure.
         """
         if not image_path or not os.path.exists(image_path):
-            return None, None, ""
+            return None, None, "", 0.0
 
-        # Apply brightness/saturation filter before OCR.
-        # This step is the key improvement for TV recordings:
-        # it keeps only bright, low-saturation pixels (timestamps)
-        # and discards colored backgrounds, logos, and scene content.
         processed_path = extract_bright_text(
             image_path,
             brightness_threshold=self.brightness_threshold,
             sat_max=self.sat_max,
             region=self.region,
-            skip_filter=self.radio_mode,  # Pass the radio_mode flag
+            skip_filter=self.radio_mode,
             debug=self.debug,
-            aggressive=self.aggressive  # Pass aggressive flag
+            aggressive=self.aggressive
         )
 
         print(f"\nOCR raw results for {image_path} (preprocessed: {processed_path}):")
 
-        # Use Doctr for OCR - exactly like your working script
         try:
-            # Load the processed image for Doctr - same method as your working script
             doc = DocumentFile.from_images(processed_path)
             result = self.ocr(doc)
-            
+
             date_found = None
             time_found = None
             xxx_parts = []
-            
-            # Extract text exactly like your working script
+            all_confidences = []
+
             lines = []
             for page in result.pages:
                 for block in page.blocks:
                     for line in block.lines:
                         text = " ".join([word.value for word in line.words])
+                        # Collect per-word confidences
+                        for word in line.words:
+                            all_confidences.append(word.confidence)
+
                         if text.strip():
                             print(f"  -> '{text}'")
                             lines.append(text)
-                            
-                            # Process the extracted text
+
                             d, tm = self.extract_datetime(text)
-                            
                             if d and not date_found:
                                 date_found = d
-                            
                             if tm and not time_found:
                                 time_found = tm
-                            
-                            # Collect non-date/time text as potential filename prefix
+
                             if not d and not tm:
                                 cleaned = self.clean_string(text)
                                 if cleaned and len(cleaned) > 2 and not cleaned.isdigit():
                                     xxx_parts.append(cleaned)
-            
-            # Also process each word individually for more granular detection
+
+            # Word-level pass for finer datetime detection
             for page in result.pages:
                 for block in page.blocks:
                     for line in block.lines:
@@ -270,8 +282,8 @@ class VideoRenamer:
                                 date_found = d
                             if tm and not time_found:
                                 time_found = tm
-            
-            # Combine all text for fallback
+
+            # Full-text fallback
             all_text = " ".join(lines)
             if not date_found and not time_found and all_text:
                 d, tm = self.extract_datetime(all_text)
@@ -279,22 +291,96 @@ class VideoRenamer:
                     date_found = d
                 if tm and not time_found:
                     time_found = tm
-            
+
             xxx = xxx_parts[0] if xxx_parts else ""
-            
-            print(f"  => Extracted: date={date_found}, time={time_found}, prefix={xxx}")
-            
+
+            # Mean confidence over all detected words; 0 if nothing was read
+            confidence = float(np.mean(all_confidences)) if all_confidences else 0.0
+
+            print(f"  => Extracted: date={date_found}, time={time_found}, "
+                  f"prefix={xxx}, confidence={confidence:.3f}")
+
         except Exception as e:
             print(f"  [ERROR] Doctr OCR failed: {e}")
             date_found = None
             time_found = None
             xxx = ""
+            confidence = 0.0
 
-        # Clean up the processed mask image
         if processed_path != image_path and os.path.exists(processed_path):
             os.remove(processed_path)
 
-        return date_found, time_found, xxx
+        return date_found, time_found, xxx, confidence
+
+    # ------------------------------------------------------------------
+    # Multi-frame scanning
+    # ------------------------------------------------------------------
+
+    def scan_for_timestamp(self, video_path, duration, from_start=True):
+        """
+        Scans frames every `frame_step` seconds until a reading whose
+        confidence meets `min_confidence` is found.
+
+        Args:
+            video_path (str): Path to the video file.
+            duration (float): Total video duration in seconds.
+            from_start (bool): True  → scan forward  (finding start timestamp).
+                               False → scan backward (finding end timestamp).
+
+        Returns:
+            tuple: (date_str, time_str, prefix_str, frame_offset_seconds)
+                   frame_offset_seconds is the position inside the video where
+                   the confident reading was made — used to back-calculate the
+                   real start / end time of the recording.
+                   Returns (None, None, "", None) if no confident frame found.
+        """
+        if duration is None:
+            return None, None, "", None
+
+        # Build the list of offsets to probe
+        if from_start:
+            # 0, step, 2*step, … up to half the video (no point going further)
+            offsets = list(np.arange(0, duration / 2, self.frame_step))
+        else:
+            # duration, duration-step, … down to half the video
+            offsets = list(np.arange(duration, duration / 2, -self.frame_step))
+
+        direction = "forward" if from_start else "backward"
+        print(f"\n  [SCAN] Scanning {direction} through {len(offsets)} frame(s) "
+              f"(step={self.frame_step}s, min_confidence={self.min_confidence})")
+
+        tmp_frame = "scan_frame.jpg"
+
+        for offset in offsets:
+            offset = max(0.0, min(offset, duration))
+            print(f"  [SCAN] Trying offset {offset:.1f}s …", end="")
+
+            ok = self.extract_frame_at(video_path, offset, tmp_frame)
+            if not ok:
+                print(" (frame extraction failed, skipping)")
+                continue
+
+            date, time, prefix, conf = self.get_info_from_image(tmp_frame)
+
+            # We require at least the time to be present for a useful reading
+            if time and conf >= self.min_confidence:
+                print(f"  [SCAN] ✓ Confident reading at {offset:.1f}s "
+                      f"(confidence={conf:.3f}): date={date}, time={time}")
+                if os.path.exists(tmp_frame):
+                    os.remove(tmp_frame)
+                return date, time, prefix, offset
+
+            print(f" confidence={conf:.3f} — not good enough, continuing…")
+
+        if os.path.exists(tmp_frame):
+            os.remove(tmp_frame)
+
+        print("  [SCAN] No confident reading found during scan.")
+        return None, None, "", None
+
+    # ------------------------------------------------------------------
+    # Main processing loop
+    # ------------------------------------------------------------------
 
     def process_folder(self):
         """Iterates over the folder and renames video files based on OCR results."""
@@ -307,14 +393,61 @@ class VideoRenamer:
 
         for idx, filename in enumerate(files, start=1):
             video_path = os.path.join(self.folder_path, filename)
-            print(f"Processing: {filename}...")
+            print(f"\n{'='*60}")
+            print(f"Processing ({idx}/{len(files)}): {filename}")
+            print('='*60)
 
-            first_img, last_img = self.extract_frames(video_path)
+            # ── Step 1: fast path — try first & last frames ──────────────
+            first_img, last_img, duration = self.extract_frames(video_path)
 
-            date_start, time_start, ocr_prefix = self.get_info_from_image(first_img)
-            _, time_end, _ = self.get_info_from_image(last_img)
+            date_start, time_start, ocr_prefix, conf_start = self.get_info_from_image(first_img)
+            _, time_end, _, conf_end = self.get_info_from_image(last_img)
 
-            # Fallback logic: if only one timestamp was found, estimate the other
+            # ── Step 2: multi-frame scan when fast-path confidence is low ─
+            #
+            # If the first frame reading is not confident enough, scan
+            # forward until we find a clear frame, then subtract the
+            # in-video offset to recover the real recording start time.
+            #
+            start_offset = 0.0   # seconds into the video of the winning frame
+            end_offset   = duration if duration else 0.0
+
+            if (not time_start or conf_start < self.min_confidence) and duration:
+                print(f"\n  [INFO] First-frame confidence too low "
+                      f"({conf_start:.3f} < {self.min_confidence}). "
+                      f"Activating multi-frame scan for START timestamp…")
+
+                scan_date, scan_time, scan_prefix, start_offset = \
+                    self.scan_for_timestamp(video_path, duration, from_start=True)
+
+                if scan_time:
+                    # Back-calculate: real_start = timestamp_at_offset − offset
+                    real_start = self.adjust_time(scan_time, -start_offset)
+                    print(f"  [SCAN] Timestamp at offset {start_offset:.1f}s = {scan_time}  "
+                          f"→  estimated recording start = {real_start}")
+                    time_start = real_start
+                    if scan_date and not date_start:
+                        date_start = scan_date
+                    if scan_prefix and not ocr_prefix:
+                        ocr_prefix = scan_prefix
+
+            if (not time_end or conf_end < self.min_confidence) and duration:
+                print(f"\n  [INFO] Last-frame confidence too low "
+                      f"({conf_end:.3f} < {self.min_confidence}). "
+                      f"Activating multi-frame scan for END timestamp…")
+
+                _, scan_time_end, _, end_offset = \
+                    self.scan_for_timestamp(video_path, duration, from_start=False)
+
+                if scan_time_end:
+                    # Forward-calculate: real_end = timestamp_at_offset + remaining
+                    seconds_remaining = duration - end_offset
+                    real_end = self.adjust_time(scan_time_end, seconds_remaining)
+                    print(f"  [SCAN] Timestamp at offset {end_offset:.1f}s = {scan_time_end}  "
+                          f"→  estimated recording end = {real_end}")
+                    time_end = real_end
+
+            # ── Step 3: fallback when only one side was found ────────────
             if time_start and not time_end:
                 print("  -> Applying fallback: end time = start + X minutes")
                 time_end = self.fallback_time(time_start, add=True)
@@ -323,8 +456,8 @@ class VideoRenamer:
                 print("  -> Applying fallback: start time = end - X minutes")
                 time_start = self.fallback_time(time_end, add=False)
 
+            # ── Step 4: rename ───────────────────────────────────────────
             if date_start and time_start and time_end:
-                # Prefix priority: CLI argument > OCR-detected text > file index
                 if self.forced_prefix:
                     prefix = self.forced_prefix
                 elif ocr_prefix:
@@ -338,11 +471,11 @@ class VideoRenamer:
 
                 try:
                     os.rename(video_path, new_path)
-                    print(f"SUCCESS: {filename} -> {new_name}")
+                    print(f"\nSUCCESS: {filename} -> {new_name}")
                 except Exception as e:
-                    print(f"ERROR renaming {filename}: {e}")
+                    print(f"\nERROR renaming {filename}: {e}")
             else:
-                print(f"FAILED: Incomplete info for {filename}")
+                print(f"\nFAILED: Incomplete info for {filename}")
                 if not date_start: print("  - Date not found")
                 if not time_start: print("  - Start time not found")
                 if not time_end:   print("  - End time not found")
@@ -377,17 +510,25 @@ if __name__ == "__main__":
     parser.add_argument("--region", type=float, nargs=4,
                         metavar=('X1', 'Y1', 'X2', 'Y2'),
                         help="Crop region for OCR as fractions of image size (0.0-1.0). "
-                             "Example: --region 0 0.85 0.5 1.0 targets the bottom-left corner. "
-                             "Highly recommended for TV recordings to reduce false positives.")
+                             "Example: --region 0 0.85 0.5 1.0 targets the bottom-left corner.")
 
     parser.add_argument("--radio", action="store_true",
-                        help="Skip brightness/saturation filtering (for radio recordings with simple backgrounds).")
+                        help="Skip brightness/saturation filtering (for radio recordings).")
 
     parser.add_argument("--debug", action="store_true",
                         help="Save debug images to see what the OCR is processing.")
 
     parser.add_argument("--aggressive", action="store_true",
                         help="Use aggressive background rejection for white text on TV recordings.")
+
+    # ── New multi-frame scan arguments ───────────────────────────────────
+    parser.add_argument("--frame-step", type=int, default=5,
+                        help="Seconds between frames when scanning for a confident timestamp "
+                             "(default: 5). Lower = slower but more thorough.")
+
+    parser.add_argument("--min-confidence", type=float, default=0.85,
+                        help="Minimum mean OCR confidence (0.0–1.0) required to accept a "
+                             "timestamp reading without scanning further (default: 0.85).")
 
     args = parser.parse_args()
 
@@ -401,7 +542,9 @@ if __name__ == "__main__":
             region=tuple(args.region) if args.region else None,
             radio_mode=args.radio,
             debug=args.debug,
-            aggressive=args.aggressive
+            aggressive=args.aggressive,
+            frame_step=args.frame_step,
+            min_confidence=args.min_confidence,
         )
         renamer.process_folder()
     else:
