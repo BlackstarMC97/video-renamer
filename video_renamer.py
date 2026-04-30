@@ -1,4 +1,5 @@
 import os
+import sys
 import subprocess
 import re
 import cv2
@@ -7,6 +8,47 @@ from doctr.io import DocumentFile
 from doctr.models import ocr_predictor
 import argparse
 from datetime import datetime, timedelta
+import imageio_ffmpeg
+
+
+# ---------------------------------------------------------------------------
+# Binary resolvers — work both in plain Python and when frozen by PyInstaller
+# ---------------------------------------------------------------------------
+
+def get_ffmpeg() -> str:
+    """
+    Returns the path to the ffmpeg binary.
+    imageio_ffmpeg ships its own ffmpeg, so no system install is needed.
+    PyInstaller picks it up automatically via --collect-all imageio_ffmpeg.
+    """
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def get_ffprobe() -> str:
+    """
+    Returns the path to ffprobe.
+    - When frozen by PyInstaller: looks for ffprobe(.exe) next to the .exe
+      (you must add it with --add-binary "ffprobe.exe;." at build time).
+    - In plain Python: falls back to 'ffprobe' on PATH.
+    """
+    if getattr(sys, 'frozen', False):
+        # PyInstaller unpacks binaries into sys._MEIPASS
+        base = sys._MEIPASS
+        name = "ffprobe.exe" if sys.platform == "win32" else "ffprobe"
+        candidate = os.path.join(base, name)
+        if os.path.exists(candidate):
+            return candidate
+    return "ffprobe"  # rely on system PATH during development
+
+
+def run_silent(cmd, **kwargs):
+    """
+    Runs a subprocess without flashing a console window on Windows.
+    On non-Windows systems it behaves exactly like subprocess.run().
+    """
+    if sys.platform == "win32":
+        kwargs.setdefault("creationflags", subprocess.CREATE_NO_WINDOW)
+    return subprocess.run(cmd, **kwargs)
 
 
 def extract_bright_text(image_path, brightness_threshold=180, sat_max=80, region=None, skip_filter=False, debug=False, aggressive=False):
@@ -111,16 +153,16 @@ class VideoRenamer:
 
     def extract_frame_at(self, video_path, offset_seconds, out_path):
         """Extracts a single frame at a given second offset into the video."""
-        subprocess.run([
-            'ffmpeg', '-y', '-ss', str(offset_seconds),
+        run_silent([
+            get_ffmpeg(), '-y', '-ss', str(offset_seconds),
             '-i', video_path, '-frames:v', '1', '-q:v', '2', out_path
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return os.path.exists(out_path)
 
     def get_video_duration(self, video_path):
         """Returns video duration in seconds via ffprobe."""
-        result = subprocess.run([
-            'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+        result = run_silent([
+            get_ffprobe(), '-v', 'error', '-show_entries', 'format=duration',
             '-of', 'default=noprint_wrappers=1:nokey=1', video_path
         ], capture_output=True, text=True)
         try:
@@ -136,14 +178,14 @@ class VideoRenamer:
         first_frame = "first_frame.jpg"
         last_frame = "last_frame.jpg"
 
-        subprocess.run([
-            'ffmpeg', '-y', '-i', video_path, '-frames:v', '1', '-q:v', '2', first_frame
+        run_silent([
+            get_ffmpeg(), '-y', '-i', video_path, '-frames:v', '1', '-q:v', '2', first_frame
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         duration = self.get_video_duration(video_path)
         if duration:
-            subprocess.run([
-                'ffmpeg', '-y', '-ss', str(max(0, duration - 0.5)),
+            run_silent([
+                get_ffmpeg(), '-y', '-ss', str(max(0, duration - 0.5)),
                 '-i', video_path, '-frames:v', '1', '-q:v', '2', last_frame
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
