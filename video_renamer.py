@@ -144,7 +144,7 @@ class VideoRenamer:
 
         self.ocr = ocr_predictor(pretrained=True)
 
-        self.date_pattern = re.compile(r'(\d{4}[-/.]\d{2}[-/.]\d{2})|(\d{2}[-/.]\d{2}[-/.]\d{4})')
+        self.date_pattern = re.compile(r'(\d{4}[-/.]\d{2}[-/.]\d{2})|(\d{2}[-/.]\d{2}[-/.]\d{4})|(\d{2}[-/.]\d{2}[-/.]\d{2})')
         self.time_pattern = re.compile(r'\d{2}\s*[:\-.]\s*\d{2}\s*[:\-.]\s*\d{2}')
 
     # ------------------------------------------------------------------
@@ -212,6 +212,38 @@ class VideoRenamer:
             return "-".join(parts)
         return None
 
+    def normalize_date(self, date_str):
+        """Normalizes date to YYYY-MM-DD format regardless of input format."""
+        if not date_str:
+            return None
+        
+        # Replace common separators with dash
+        date_str = date_str.replace('/', '-').replace('.', '-')
+        parts = date_str.split('-')
+        
+        if len(parts) != 3:
+            return date_str
+        
+        # Check if first part is 4 digits (YYYY-MM-DD)
+        if len(parts[0]) == 4:
+            # Already in YYYY-MM-DD format
+            return date_str
+        
+        # Assume DD-MM-YYYY or MM-DD-YYYY
+        # Try DD-MM-YYYY first (most common for DVRs)
+        if len(parts[0]) == 2 and len(parts[2]) == 4:
+            # Reorder to YYYY-MM-DD
+            return f"{parts[2]}-{parts[1]}-{parts[0]}"
+        
+        # Check if it's YY-MM-DD (2-digit year)
+        if len(parts[0]) == 2 and len(parts[1]) == 2 and len(parts[2]) == 2:
+            # Assume DD-MM-YY and convert to YYYY-MM-DD with 20YY prefix
+            year = 2000 + int(parts[2])
+            return f"{year}-{parts[1]}-{parts[0]}"
+        
+        # Fallback: just return as-is
+        return date_str
+
     def extract_datetime(self, text):
         """Extracts a date and a time from an OCR text string."""
         date_match = self.date_pattern.search(text)
@@ -219,7 +251,8 @@ class VideoRenamer:
         time = None
 
         if date_match:
-            date = date_match.group(0).replace('/', '-').replace('.', '-')
+            raw_date = date_match.group(0)
+            date = self.normalize_date(raw_date)
             remaining = text.replace(date_match.group(0), '')
         else:
             remaining = text
